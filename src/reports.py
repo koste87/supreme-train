@@ -1,41 +1,37 @@
-import datetime
-import datetime as dt
-import logging
-from pathlib import Path
-import pandas as pd
-from src.config import file_path
-from src.utils import get_data, reader_transaction_excel
-from functools import wraps
+import functools
+import json
+from datetime import datetime, timedelta
+from src.logger import setup_logger
 from typing import Any, Callable
+import pandas as pd
 
-logger = logging.getLogger("logs")
-logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler("..\\logs\\reports.log", encoding="utf-8")
-file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s: %(message)s")
-file_handler.setFormatter(file_formatter)
-logger.addHandler(file_handler)
+logger = setup_logger("reports", "logs/reports.log")
 
 
-ROOT_PATH = Path(__file__).resolve().parent.parent
+def report_to_file_default(func: Callable) -> Callable:
+    """Записывает в файл результат, который возвращает функция, формирующая отчет."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = func(*args, **kwargs)
+        with open("function_operation_report.txt", "w") as file:
+            file.write(str(result))
+        logger.info(f"Записан результат работы функции {func}")
+        return result
+
+    return wrapper
 
 
-def log(filename: Any = None) -> Callable:
-    """декоратор,который логирует вызов функции и ее результат в файл или в консоль"""
+def report_to_file(filename: str = "function_operation_report.txt") -> Callable:
+    """Записывает в переданный файл результат, который возвращает функция, формирующая отчет."""
 
-    def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            try:
-                result = func(*args, **kwargs)
-                log_messege = "my_function ok\n"
-            except Exception as e:
-                result = None
-                log_messege = f"my_function error: {e}. Inputs: {args}, {kwargs} \n"
-            if filename:
-                with open(filename, "a", encoding="utf-8") as file:
-                    file.write(log_messege)
-            else:
-                print(log_messege)
+    def decorator(func: Callable[[tuple[Any, ...], dict[str, Any]], Any]) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            result = func(*args, **kwargs)
+            with open(filename, "w") as file:
+                file.write(str(result))
+            logger.info(f"Записан результат работы функции {func} в файл {filename}")
             return result
 
         return wrapper
@@ -43,24 +39,81 @@ def log(filename: Any = None) -> Callable:
     return decorator
 
 
-def spending_by_category(df_transactions: pd.DataFrame, category: str, date: [str] = None) -> pd.DataFrame:
-    """Функция возвращает траты по заданной категории за последние три месяца (от переданной даты)"""
-    if date is None:
-        fin_data = dt.datetime.now()
-    else:
-        fin_data = get_data(date)
-    start_data = fin_data.replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(days=91)
-    transactions_by_category = df_transactions.loc[
-        (pd.to_datetime(df_transactions["Дата операции"], dayfirst=True) <= fin_data)
-        & (pd.to_datetime(df_transactions["Дата операции"], dayfirst=True) >= start_data)
-        & (df_transactions["Категория"] == category)
-    ]
-    return transactions_by_category .groupby(["Категория", "Дата операции"]).sum().reset_index()
+# дата гггг.мм.дд
+@report_to_file_default
+def spending_by_category(transactions: pd.DataFrame, category: str, date: Any = None) -> Any:
+    """Функция возвращает траты по заданной категории за последние три месяца
+    (от переданной даты, если дата не передана берет текущую)"""
+    try:
+        transactions["Дата операции"] = pd.to_datetime(transactions["Дата операции"], format="%d.%m.%Y %H:%M:%S")
+        if date is None:
+            date = datetime.now()
+        else:
+            date = datetime.strptime(date, "%Y.%m.%d")
+        start_date = date - timedelta(days=date.day - 1) - timedelta(days=3 * 30)
+        filtered_transactions = transactions[
+            (transactions["Дата операции"] >= start_date)
+            & (transactions["Дата операции"] <= date)
+            & (transactions["Категория"] == category)
+        ]
+        grouped_transactions = filtered_transactions.groupby(pd.Grouper(key="Дата операции", freq="ME")).sum()
+        logger.info(f"Траты за последние три месяца от {date} по категории {category}")
+        return grouped_transactions.to_dict(orient="records")
+    except Exception as e:
+        print(f"Возникла ошибка {e}")
+        logger.error(f"Возникла ошибка {e}")
+        return ""
 
 
-if __name__ == "__main__":
-    result = spending_by_category(
-        reader_transaction_excel(str(ROOT_PATH) + file_path), "Аптеки", "26.07.2019 20:58:55"
-    )
-    print(result)
-    # выводит на экран результат работы функции, в случае успеха - None.
+@report_to_file_default
+def spending_by_weekday(transactions: pd.DataFrame, date: Any = None) -> str:
+    """Функция возвращает средние траты в каждый из дней недели за последние три месяца (от переданной даты)"""
+    try:
+        transactions["Дата операции"] = pd.to_datetime(transactions["Дата операции"], format="%d.%m.%Y %H:%M:%S")
+        if date is None:
+            date = datetime.now()
+        else:
+            date = datetime.strptime(date, "%Y.%m.%d")
+        start_date = date - timedelta(days=date.day) - timedelta(days=3 * 30)
+        filtered_transactions = transactions[
+            (transactions["Дата операции"] >= start_date) & (transactions["Дата операции"] <= date)
+        ]
+        filtered_transactions = filtered_transactions.copy()
+        filtered_transactions.loc[:, "День недели"] = filtered_transactions["Дата операции"].dt.dayofweek
+        grouped_transactions = filtered_transactions.groupby("День недели")["Сумма операции"].mean()
+        weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+        grouped_transactions.index = weekdays
+        result_dict = {day: grouped_transactions.get(day, 0.0) for day in weekdays}
+        logger.info(f"Средние траты по дням недели начиная с {date}")
+        return json.dumps(result_dict, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Возникла ошибка {e}")
+        logger.error(f"Возникла ошибка {e}")
+        return ""
+
+
+@report_to_file_default
+def spending_by_workday(transactions: pd.DataFrame, date: Any = None) -> str:
+    """Функция выводит средние траты в рабочий и в выходной день за последние три месяца (от переданной даты)."""
+    try:
+        transactions["Дата операции"] = pd.to_datetime(transactions["Дата операции"], format="%d.%m.%Y %H:%M:%S")
+        if date is None:
+            date = datetime.now()
+        else:
+            date = datetime.strptime(date, "%Y.%m.%d")
+        weekend_days = [5, 6]
+        start_date = date - timedelta(days=date.day) - timedelta(days=3 * 30)
+        filtered_transactions = transactions[
+            (transactions["Дата операции"] >= start_date) & (transactions["Дата операции"] <= date)
+        ]
+        filtered_transactions = filtered_transactions.copy()
+        filtered_transactions["День недели"] = filtered_transactions["Дата операции"].dt.dayofweek
+        filtered_transactions["Тип дня"] = "Рабочий"
+        filtered_transactions.loc[filtered_transactions["День недели"].isin(weekend_days), "Тип дня"] = "Выходной"
+        grouped_transactions = filtered_transactions.groupby("Тип дня")["Сумма операции"].mean()
+        logger.info(f"средние траты за последние три месяца от {date} по рабочим и выходным дням")
+        return json.dumps(grouped_transactions.to_dict(), ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Возникла ошибка {e}")
+        logger.error(f"Возникла ошибка {e}")
+        return ""
